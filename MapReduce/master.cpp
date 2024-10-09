@@ -210,6 +210,13 @@ void Master::setReduceStat(int taskIndex)
     m_assign_lock.unlock();
 }
 
+bool Master::Done()
+{
+    m_assign_lock.lock();
+    int len = finishedReduceTask.size();
+    m_assign_lock.unlock();
+    return len==m_reduceNum; //reduce的hashmap若是达到reduceNum，reduce任务及总任务完成
+}
 int main(int argc,char* argv[])
 {
     if(argc<2){
