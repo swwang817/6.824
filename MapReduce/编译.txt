@@ -1,2 +1,3 @@
 g++ -fpic -c map_reduceFun.cpp 
 g++ -shared map_reduceFun.o -o libmrFunc.so
+g++ master.cpp -lzmq -pthread -o master
