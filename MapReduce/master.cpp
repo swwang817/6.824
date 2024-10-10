@@ -95,7 +95,7 @@ string Master::assignTask()
     return "empty";
 }
 
-/*回收map的定时线程*/
+/* 回收map的定时线程 */
 void* Master::waitMapTask(void* arg){
     Master* map=(Master*)arg;
     void* status;
