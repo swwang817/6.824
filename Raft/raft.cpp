@@ -126,11 +126,11 @@ public:
     AppendEntriesReply appendEntries(AppendEntriesArgs args);   // append的RPChandler
     bool checkLogUptodate(int term,int index);                  // 判断是否更新日志(两个准则),vote时会用到
     void push_backLog(LogEntry log);                            // 插入新日志
-    vector<LogEntry> getCmdAndTerm(string text);                // 用的RPC不支持传容器，所以封装成string，最高是解封装恢复函数
+    vector<LogEntry> getCmdAndTerm(string text);                // 用的RPC不支持传容器，所以封装成string，这是个解封装恢复函数
     StartRet start(Operation op);                               // 向raft传日志的函数，只有leader响应并立即返回，应用层用到
     void printLogs(); 
 
-    void serizlize();                                           // 序列化
+    void serialize();                                           // 序列化
     bool deserialize();                                         // 反序列化
     void saveRaftState();                                       // 持久化
     void readRaftState();                                       // 读取持久化状态
@@ -461,4 +461,273 @@ void* Raft::processEntriesLoop(void* arg)
             i++;
         }
     }
+}
+
+/* Leader定时发送appendRPC的函数 */
+void* Raft::sendAppendEntries(void* arg)
+{
+    Raft* raft=(Raft*)arg;
+    buttonrpc client;
+    AppendEntriesArgs args;
+    raft->m_lock.lock();
+
+    if(raft->cur_peerId==raft->m_peerId){
+        raft->cur_peerId++;
+    }
+    int clientPeerId=raft->cur_peerId;
+    client.as_client("127.0.0.1",raft->m_peers[raft->cur_peerId++].m_port.second);
+    if(raft->cur_peerId==raft->m_peers.size()||
+        raft->cur_peerId==raft->m_peers.size()-1&&raft->m_peerId==raft->cur_peerId){
+        raft->cur_peerId=0;
+    }
+
+    args.m_term=raft->m_curTerm;
+    args.m_leaderId=raft->m_peerId;
+    args.m_leaderCommit=raft->m_commitIndex;
+    args.m_prevLogIndex=raft->m_nextIndex[clientPeerId]-1;
+
+    for(int i=args.m_prevLogIndex;i<raft->m_logs.size();i++){
+        args.m_sendLogs+=(raft->m_logs[i].m_command+','+to_string(raft->m_logs[i].m_term)+';');
+    }
+    if(args.m_prevLogIndex==0){
+        args.m_prevLogTerm=0;
+        if(raft->m_logs.size()!=0){
+            args.m_prevLogTerm=raft->m_logs[0].m_term;
+        }
+    } else {
+        args.m_prevLogTerm=raft->m_logs[args.m_prevLogIndex-1].m_term;
+    }
+
+    printf("[%d] -> [%d]'s prevLogIndex: %d, prevLofTerm: %d\n", raft->m_peerId,clientPeerId,args.m_prevLogIndex,args.m_prevLogTerm);
+
+    raft->m_lock.unlock();
+    AppendEntriesReply reply=client.call<AppendEntriesReply>("appendEntries",args).val();
+
+    raft->m_lock.lock();
+    if(reply.m_term>raft->m_curTerm){
+        raft->m_state=FOLLOWER;
+        raft->m_curTerm=reply.m_term;
+        raft->m_votedFor=-1;
+        raft->saveRaftState();
+        raft->m_lock.unlock();
+        return NULL;
+    }
+
+    // append成功
+    if(reply.m_success){
+        raft->m_nextIndex[clientPeerId]+=raft->getCmdAndTerm(args.m_sendLogs).size();
+        raft->m_matchIndex[clientPeerId]=raft->m_nextIndex[clientPeerId]-1;
+
+        vector<int> tmpIndex=raft->m_matchIndex;
+        sort(tmpIndex.begin(),tmpIndex.end());
+        int realMajotiryMatchIndex=tmpIndex[tmpIndex.size()/2];
+        if(realMajotiryMatchIndex>raft->m_commitIndex&&
+                raft->m_logs[realMajotiryMatchIndex-1].m_term==raft->m_curTerm){
+            raft->m_commitIndex=realMajotiryMatchIndex;
+        }
+    } else {// append失败
+        if(reply.m_conflict_term!=-1){
+            int leader_conflict_index=-1;
+            for(int index=args.m_prevLogIndex;index>=1;index--){
+                if(raft->m_logs[index-1].m_term==reply.m_conflict_term){
+                    leader_conflict_index=index;
+                    break;
+                }
+            }
+            if(leader_conflict_index!=-1){
+                raft->m_nextIndex[clientPeerId]=leader_conflict_index+1;
+            } else {
+                raft->m_nextIndex[clientPeerId]=reply.m_conflict_index;
+            }
+        }else{ // m_conflict_term==1代表follower的log长度小于leader记录的nextIndex-1
+            raft->m_nextIndex[clientPeerId]=reply.m_conflict_index+1;
+        }
+    }
+    raft->saveRaftState();
+    raft->m_lock.unlock();
+}
+
+/* 这个函数是client收到appendLog请求执行的函数 返回appendLog是否成功等 */
+AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args){
+    vector<LogEntry> recvLog=getCmdAndTerm(args.m_sendLogs);
+    AppendEntriesReply reply;
+    m_lock.lock();
+    reply.m_term=m_curTerm;
+    reply.m_success=false;
+    reply.m_conflict_index=-1;
+    reply.m_conflict_term=-1;
+
+    // leader的term小于当前服务器的term直接返回false
+    if(args.m_term<m_curTerm){
+        m_lock.unlock();
+        return reply;
+    }
+
+    // leader的term大于等于当前服务器的term，需要修改当前服务器的term
+    if(args.m_term>=m_curTerm){
+        if(args.m_term>m_curTerm){
+            m_votedFor=-1;
+            saveRaftState();
+        }
+        m_curTerm=args.m_term;
+        m_state=FOLLOWER;
+    }
+
+    printf("[%d] recv append from [%d] at self term%d,send term%d,duration is %d\n",
+            m_peerId,args.m_leaderId,m_curTerm,args.m_term,getMyduration(m_lastWakeTime));
+    gettimeofday(&m_lastWakeTime,NULL);
+
+    int logSize=0;
+    // 如果当前服务器没有log 就可以直接把leader传来的log写入
+    if(m_logs.size()==0){
+        for(const auto& log:recvLog){
+            push_backLog(log);
+        }
+        saveRaftState();
+        logSize=m_logs.size();
+        if(m_commitIndex<args.m_leaderCommit){ // 将follower的commit和leader同步
+            m_commitIndex=min(args.m_leaderCommit,logSize);
+        }
+        m_lock.unlock();
+        reply.m_success=true;
+        return reply;
+    }
+    // 如果follower的log长度小于leader记录的nextIndex-1就需要返回false并且记录conflict_index
+    if(m_logs.size()<args.m_prevLogIndex){
+        printf("[%d]'s logs.size:%d < [%d]'s prevLogIdx: %d\n",m_peerId,m_logs.size(),args.m_leaderId,args.m_prevLogIndex);
+        reply.m_conflict_index=m_logs.size();
+        m_lock.unlock();
+        reply.m_success=false;
+        return reply;
+    }
+    // 如果follower的log长度不小于leader记录的nextIndex-1 但follower记录的term和leader记录的不同
+    // 就需要返回false并且记录conflict_index和conflict_term
+    // 通过判断conflict_term来判断是哪一种冲突
+    if(args.m_prevLogIndex>0&&m_logs[args.m_prevLogIndex-1].m_term!=args.m_prevLogTerm){
+        printf("[%d]'s prevLogterm : %d != [%d]'s prevLogTerm : %d\n",m_peerId,m_logs[args.m_prevLogIndex-1].m_term,args.m_leaderId,args.m_prevLogTerm);
+
+        reply.m_conflict_term=m_logs[args.m_prevLogIndex-1].m_term;
+        for(int index=1;index<=m_logs[args.m_prevLogIndex-1].m_term;index++){
+            if(m_logs[index-1].m_term==reply.m_conflict_term){
+                reply.m_conflict_index=index;
+                break;
+            }
+        }
+        m_lock.unlock();
+        reply.m_success=false;
+        return reply;
+    }
+    // 如果不冲突就把follower多出来的log删除
+    logSize=m_logs.size();
+    for(int i=args.m_prevLogIndex;i<logSize;i++){
+        m_logs.pop_back();
+    }
+    for(const auto& log:recvLog){
+        push_backLog(log);
+    }
+    saveRaftState();
+    logSize=m_logs.size();
+    if(m_commitIndex<args.m_leaderCommit){
+        m_commitIndex=min(logSize,args.m_leaderCommit);
+    }
+
+    for(auto a:m_logs) printf("%d ",a.m_term);
+    printf("[%d] sync success\n",m_peerId);
+    m_lock.unlock();
+    reply.m_success=true;
+    return reply;
+}
+
+vector<LogEntry> Raft::getCmdAndTerm(string text)
+{
+    vector<LogEntry> logs;
+    int n=text.size();
+    vector<string> str;
+    string tmp="";
+    for(int i=0;i<n;i++){
+        if(text[i]!=';'){
+            tmp+=text[i];
+        } else {
+            if(tmp.size()!=0) str.emplace_back(tmp);
+            tmp="";
+        }
+    }
+    for(int i=0;i<str.size();i++){
+        tmp="";
+        int j=0;
+        for(j=0;j<str[i].size();j++){
+            if(str[i][j]!=','){
+                tmp+=str[i][j];
+            }else break;
+        }
+        string number(str[i].begin()+j,str[i].end());
+        int num=atoi(number.c_str());
+        logs.emplace_back(LogEntry(tmp,num));
+    }
+    return logs;
+}
+
+void Raft::push_backLog(LogEntry log)
+{
+    m_logs.emplace_back(log);
+}
+
+pair<int,bool> Raft::getState()
+{
+    pair<int,bool> serverState;
+    serverState.first=m_curTerm;
+    serverState.second=(m_state==LEADER);
+    return serverState;
+}
+
+void Raft::kill()
+{
+    dead=1;
+}
+
+StartRet Raft::start(Operation op)
+{
+    StartRet ret;
+    m_lock.lock();
+    RAFT_STATE state=m_state;
+    if(state!=LEADER){
+        m_lock.unlock();
+        return ret;
+    }
+    ret.m_cmdIndex=m_logs.size();
+    ret.m_curTerm=m_curTerm;
+    ret.isLeader=true;
+
+    LogEntry log;
+    log.m_command=op.getcmd();
+    log.m_term=m_curTerm;
+    push_backLog(log);
+    m_lock.unlock();
+
+    return ret;
+}
+
+void Raft::printLogs()
+{
+    for(auto a:m_logs){
+        printf("logs : %d\n",a.m_term);
+    }
+    cout<<endl;
+}
+
+/* 序列化 */
+void Raft::serialize()
+{
+    string str;
+    str+=to_string(this->persister.cur_term)+";"+to_string(this->persister.votedFor)+";";
+    for(const auto& log:this->persister.logs){
+        str+=log.m_command+","+to_string(log.m_term)+".";
+    }
+    string filename="persister-"+to_string(m_peerId);
+    int fd=open(filename.c_str(),O_WRONLY|O_CREAT,0664);
+    if(fd==-1){
+        perror("open");
+        exit(-1);
+    }
+    int len=write(fd,str.c_str(),str.size());
 }
