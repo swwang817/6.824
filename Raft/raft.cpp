@@ -715,7 +715,7 @@ void Raft::printLogs()
     cout<<endl;
 }
 
-/* 序列化 */
+/* 序列化 就是保存成文件 */
 void Raft::serialize()
 {
     string str;
@@ -730,4 +730,134 @@ void Raft::serialize()
         exit(-1);
     }
     int len=write(fd,str.c_str(),str.size());
+}
+
+/* 反序列化 就是从文件读出来 */
+bool Raft::deserialize()
+{
+    string filename="persister-"+to_string(m_peerId);
+    if(access(filename.c_str(),F_OK)==-1) return false;
+    int fd=open(filename.c_str(),O_RDONLY);
+    if(fd==-1){
+        perror("open");
+        return false;
+    }
+    int length=lseek(fd,0,SEEK_END);
+    lseek(fd,0,SEEK_SET);
+    char buf[length];
+    bzero(buf,length);
+    int len=read(fd,buf,length);
+    if(len!=length){
+        perror("read");
+        exit(-1);
+    }
+    string content(buf);
+    vector<string> persist;
+    string tmp="";
+    for(int i=0;i<content.size();i++){
+        if(content[i]!=';'){
+            tmp+=content[i];
+        } else {
+            if(tmp.size()!=0) persist.emplace_back(tmp);
+            tmp="";
+        }
+    }
+    persist.emplace_back(tmp);
+    this->persister.cur_term=atoi(persist[0].c_str());
+    this->persister.votedFor=atoi(persist[1].c_str());
+    vector<string> log;
+    vector<LogEntry> logs;
+    tmp="";
+    for(int i=0;i<persist[2].size();i++){
+        if(persist[2][i]!='.'){
+            tmp+=persist[2][i];
+        } else {
+            if(tmp.size()!=0) log.emplace_back(tmp);
+            tmp="";
+        }
+    }
+    for(int i=0;i<log.size();i++){
+        tmp="";
+        int j=0;
+        for(j=0;j<log[i].size();j++){
+            if(log[i][j]!=','){
+                tmp+=log[i][j];
+            } else break;
+        }
+        string number(log[i].begin()+j+1,log[i].end());
+        int num=atoi(number.c_str());
+        logs.emplace_back(LogEntry(tmp,num));
+    }
+    this->persister.logs=logs;
+    return true;
+}
+
+/* 只有在初始化的时候调用 */
+void Raft::readRaftState()
+{
+    bool ret=this->deserialize();
+    if(!ret) return;
+    this->m_curTerm=this->persister.cur_term;
+    this->m_votedFor=this->persister.votedFor;
+
+    for(const auto& log:this->persister.logs){
+        push_backLog(log);
+    }
+    printf("[%d]'s term: %d, votefor : %d,logs.size(): %d\n",m_peerId,m_votedFor,m_logs.size());
+}
+
+void Raft::saveRaftState()
+{
+    persister.cur_term=m_curTerm;
+    persister.votedFor=m_votedFor;
+    persister.logs=m_logs;
+    serialize();
+}
+
+int main(int argc,char* argv[])
+{
+    if(argc<2){
+        printf("loss parameter of peersNum\n");
+        exit(-1);
+    }
+    int peerNum=atoi(argv[1]);
+    if(peerNum%2==0){
+        printf("the peersNum should be odd\n");                 // 必须传入奇数
+        exit(-1);
+    }
+    srand((unsigned)time(NULL));
+    vector<PeersInfo> peers(peerNum);
+    for(int i=0;i<peerNum;i++){
+        peers[i].m_peerId=i;
+        peers[i].m_port.first=COMMOM_PORT+i;                    // vote的RPC端口
+        peers[i].m_port.second=COMMOM_PORT+i+peers.size();      // append的RPC端口
+    }
+
+    Raft* raft=new Raft[peers.size()];
+    for(int i=0;i<peers.size();i++){
+        raft[i].Make(peers,i);
+    }
+    /*--------------------test部分----------------------*/
+    usleep(400000);
+    for(int i=0;i<peers.size();i++){
+        if(raft[i].getState().second){
+            for(int j=0;j<1000;j++){
+                Operation opera;
+                opera.op="put";
+                opera.key=to_string(j);
+                opera.value=to_string(j);
+                raft[i].start(opera);
+                usleep(50000);
+            }
+        } else continue;
+    }
+    usleep(400000);
+    for(int i=0;i<peers.size();i++){
+        if(raft[i].getState().second){
+            raft[i].kill();
+            break;
+        }
+    }
+    /*--------------------test部分----------------------*/
+    while(1);
 }
