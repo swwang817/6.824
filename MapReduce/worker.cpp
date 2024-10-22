@@ -88,7 +88,7 @@ KeyValue getContent(char* file){
 /* 将map任务产生的中间值写入临时文件 */
 void writeKV(int fd,const KeyValue& kv)
 {
-    string temp=kv.key+",1";
+    string temp=kv.key+",1 ";
     int len=write(fd,temp.c_str(),temp.size());
     if(len==-1){
         perror("write");
@@ -233,6 +233,7 @@ void* mapWorker(void* arg)
         }else{
             disabledMapId++;
         }
+        pthread_mutex_unlock(&map_mutex);
         /* ------------------------超时重发测试部分-------------------------------- */
 
     // 3.拆分任务，任务返回为文件path以及map任务编号，将filename以及content封装到kv的key及value中
@@ -266,4 +267,116 @@ void myWrite(int fd,vector<string>& str)
     }
 }
 
+void* reduceWorker(void* arg)
+{
+    buttonrpc client;
+    client.as_client("127.0.0.1",5555);
+    bool ret=false;
+    while(1){
+        // 若工作完成直接退出reduce的worker线程
+        ret=client.call<bool>("Done").val();
+        if(ret) return NULL;
+        int reduceTaskIdx=client.call<int>("assignReduceTask").val();
+        if(reduceTaskIdx==-1) continue;
+        printf("%ld get the task%d\n",pthread_self(),reduceTaskIdx);
+        pthread_mutex_lock(&map_mutex);
 
+        /* ------------------------超时重发测试部分-------------------------------- */
+        if(disabledReduceId==1||disabledReduceId==3||disabledReduceId==5){
+            disabledReduceId++;
+            pthread_mutex_unlock(&map_mutex);
+            printf("recv task%d reduceTaskIdx is stop in %ld\n",reduceTaskIdx,pthread_self());
+            while(1){
+                sleep(2);
+            }
+        }
+        else disabledReduceId++;
+        pthread_mutex_unlock(&map_mutex);
+        /* ------------------------超时重发测试部分-------------------------------- */
+
+        // 取得reduce任务，读取对应文件，shuffle后调用reduceFunc进行reduce处理
+        vector<KeyValue> kvs=Myshuffle(reduceTaskIdx);
+        vector<string> ret=reduceF(kvs);
+        vector<string> str;// 存了最终结果 {"my 3","you 3"};
+        for(int i=0;i<kvs.size();i++){
+            str.emplace_back(kvs[i].key+" "+ret[i]);
+        }
+        string filename="mr-out"+to_string(reduceTaskIdx);
+        int fd=open(filename.c_str(),O_WRONLY|O_CREAT|O_APPEND,0664);
+        myWrite(fd,str);
+        close(fd);
+        printf("%ld finsih the task%d\n",pthread_self(),reduceTaskIdx);
+        client.call<bool>("setReduceStat",reduceTaskIdx);
+    }
+}
+
+// 删除最终输出文件，用于程序第二次执行时清除上次保存结果
+void removeOutputFiles()
+{
+    string path;
+    for(int i=0;i<MAX_REDUCE_NUM;i++){
+        path="mr-out-"+to_string(i);
+        int ret=access(path.c_str(),F_OK);
+        if(ret==0) remove(path.c_str());
+    }
+}
+
+int main()
+{
+    pthread_mutex_init(&map_mutex,NULL);
+    pthread_cond_init(&cond,NULL);
+
+    // 运行时从动态库加载map及reduce函数
+    void* handle=dlopen("./libmrFunc.so",RTLD_LAZY);
+    if(!handle){
+        cerr<<"Can't open library: "<<dlerror()<<"\n";
+        exit(-1);
+    }
+    mapF=(MapFunc)dlsym(handle,"mapF");
+    if(!mapF){
+        cerr<<"Can't load symbol 'mapF': "<<dlerror()<<"\n";
+        dlclose(handle);
+        exit(-1);
+    }
+    reduceF=(ReduceFunc)dlsym(handle,"reduceF");
+    if(!reduceF){
+        cerr<<"Can't load symbol 'reduceF': "<<dlerror()<<"\n";
+        dlclose(handle);
+        exit(-1);
+    }
+
+    // 作为RPC请求端
+    buttonrpc work_client;
+    work_client.as_client("127.0.0.1",5555);
+    work_client.set_timeout(5000);
+    map_task_num=work_client.call<int>("getMapNum").val();
+    reduce_task_num=work_client.call<int>("getReduceNum").val();
+    removeFiles();             // 若有清理上次输出的中间文件
+    removeOutputFiles();       // 清理上次输出的最终文件
+
+    // 创建多个map及reduce的worker线程
+    pthread_t tidMap[map_task_num];
+    pthread_t tidReduce[reduce_task_num];
+    for(int i=0;i<map_task_num;i++){
+        pthread_create(&tidMap[i],NULL,mapWorker,NULL);
+        pthread_detach(tidMap[i]);
+    }
+    /* 主线程在这里等待所有 map 线程完成它们的任务 */
+    pthread_mutex_lock(&map_mutex);
+    pthread_cond_wait(&cond,&map_mutex);
+    pthread_mutex_unlock(&map_mutex);
+    for(int i=0;i<reduce_task_num;i++){
+        pthread_create(&tidReduce[i],NULL,reduceWorker,NULL);
+        pthread_detach(tidReduce[i]);
+    }
+    while(1){
+        if(work_client.call<bool>("Done").val()) break;
+        sleep(1);
+    }
+
+    // 任务完成后清理中间文件，关闭打开的动态库，释放资源
+    removeFiles(); 
+    dlclose(handle);
+    pthread_mutex_destroy(&map_mutex);
+    pthread_cond_destroy(&cond);
+}

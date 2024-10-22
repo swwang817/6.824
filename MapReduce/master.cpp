@@ -101,14 +101,14 @@ void* Master::waitMapTask(void* arg){
     void* status;
     pthread_t tid;
     char op='m';
-    pthread_create(&tid,NULL,waitTime,&op);
+    pthread_create(&tid,NULL,waitTime,&op);  // 等待设置的超时时长，如果超时时长过后已完成的队列中没有对应的文件名说明没有成功
     pthread_join(tid,&status);
     map->m_assign_lock.lock();
     // 若超时后在对应的hashmap中没有该map任务完成的记录，重新将该任务加入工作队列
     if(!map->finishedMapTask.count(map->runningMapWork[map->curMapIndex])){
         printf("filename : %s is timeout\n",map->runningMapWork[map->curMapIndex].c_str());
         const char* text=map->runningMapWork[map->curMapIndex].c_str();
-        map->m_list.emplace_back(const_cast<char*>(text));
+        map->m_list.emplace_back((char*)text);  // 重新把这个文件加入需要处理的队列中
         map->curMapIndex++;
         map->m_assign_lock.unlock();
         return NULL;
