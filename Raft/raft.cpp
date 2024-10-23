@@ -10,7 +10,7 @@
 #include"./buttonrpc-master/buttonrpc.hpp"
 using namespace std;
 
-#define COMMOM_PORT 1234
+#define COMMOM_PORT 12345
 #define HEART_BEART_PERIOD 100000
 
 class Operation{
@@ -98,7 +98,7 @@ public:
     int term;
     int candidateId;
     int lastLogTerm;
-    int LastLogIndex;
+    int lastLogIndex;
 };
 
 class RequestVoteReply{
@@ -117,7 +117,7 @@ public:
     static void* sendAppendEntries(void* arg);              // 发appendRPC的线程
     static void* applyLogLoop(void* arg);                   // 持续向上层应用日志的守护线程
 
-    enum RAFT_STATE {LEADER=0,CANDIDATE,FOLLOWER};              // 用枚举定义的raft三种状态
+    enum RAFT_STATE {LEADER=0,CANDIDATE=1,FOLLOWER=2};              // 用枚举定义的raft三种状态
     void Make(vector<PeersInfo> peers,int id);                  // raft初始化
     int getMyduration(timeval last);                            // 传入某个特定计算到当下的持续时间
     void setBroadcastTime();                                    // 重新设定BroadcastTime,成为leader发心跳的时候需要重置
@@ -279,7 +279,7 @@ void* Raft::electionLoop(void* arg)
     Raft* raft=(Raft*) arg;
     bool resetFlag=false;
     while(!raft->dead){
-        int timeOut=rand()*200000+200000;
+        int timeOut=rand()%200000+200000;
         while(1){
             usleep(1000);
             raft->m_lock.lock();
@@ -300,6 +300,7 @@ void* Raft::electionLoop(void* arg)
                 raft->recvVotes=1;
                 raft->finishedVote=1;
                 raft->cur_peerId=0;
+
                 pthread_t tid[raft->m_peers.size()-1];
                 int i=0;
                 for(auto server:raft->m_peers){
@@ -345,7 +346,7 @@ void* Raft::callRequestVote(void* arg)
     RequestVoteArgs args;
     args.candidateId=raft->m_peerId;
     args.term=raft->m_curTerm;
-    args.LastLogIndex=raft->m_logs.size();
+    args.lastLogIndex=raft->m_logs.size();
     args.lastLogTerm=raft->m_logs.size()!=0?raft->m_logs.back().m_term:0;
 
     if(raft->cur_peerId==raft->m_peerId){
@@ -376,6 +377,7 @@ void* Raft::callRequestVote(void* arg)
     if(reply.VoteGranted){
         raft->recvVotes++;
     }
+    
     raft->m_lock.unlock();
 }
 
@@ -407,18 +409,21 @@ RequestVoteReply Raft::requestVote(RequestVoteArgs args)
     reply.VoteGranted=false;
     m_lock.lock();
     reply.term=m_curTerm;
-    if(m_curTerm>args.term){
+
+    if(m_curTerm>=args.term){
         m_lock.unlock();
         return reply;
     }
+
     if(m_curTerm<args.term){
         m_state=FOLLOWER;
         m_curTerm=args.term;
         m_votedFor=-1;
     }
+
     if(m_votedFor==-1||m_votedFor==args.candidateId){
         m_lock.unlock();
-        bool ret=checkLogUptodate(args.lastLogTerm,args.LastLogIndex);
+        bool ret=checkLogUptodate(args.lastLogTerm,args.lastLogIndex);
         if(!ret) return reply;
 
         m_lock.lock();
@@ -451,7 +456,7 @@ void* Raft::processEntriesLoop(void* arg)
         }
 
         gettimeofday(&raft->m_lastBroadcastTime,NULL);
-        raft->m_lock.lock();
+        raft->m_lock.unlock();
         pthread_t tid[raft->m_peers.size()-1];
         int i=0;
         for(auto server:raft->m_peers){
@@ -672,6 +677,7 @@ void Raft::push_backLog(LogEntry log)
     m_logs.emplace_back(log);
 }
 
+/* first:CurTerm second:是否等于LEADER */
 pair<int,bool> Raft::getState()
 {
     pair<int,bool> serverState;
@@ -837,6 +843,7 @@ int main(int argc,char* argv[])
     for(int i=0;i<peers.size();i++){
         raft[i].Make(peers,i);
     }
+    cout<<"--------------------------------TEST--------------------------------\n";
     /*--------------------test部分----------------------*/
     usleep(400000);
     for(int i=0;i<peers.size();i++){

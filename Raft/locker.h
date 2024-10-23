@@ -4,6 +4,7 @@
 #include<pthread.h>
 #include<semaphore.h>
 #include<iostream>
+using namespace std;
 
 class locker
 {
@@ -73,7 +74,7 @@ public:
     }
     bool timewait(pthread_mutex_t *m_mutex,struct timespec t){
         int ret=0;
-        ret=pthread_cond_wait(&m_cond,m_mutex,&t);
+        ret=pthread_cond_timedwait(&m_cond,m_mutex,&t);
         return ret==0;
     }
     bool signal(){
@@ -85,4 +86,5 @@ public:
 private:
     pthread_cond_t m_cond;
 };
+
 #endif
