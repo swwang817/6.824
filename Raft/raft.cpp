@@ -23,6 +23,7 @@ public:
     int requestId;
 };
 
+/* return cmd:op key value */
 string Operation::getcmd(){
     string cmd=op+" "+key+" "+value;
     return cmd;
@@ -228,7 +229,8 @@ int Raft::getMyduration(timeval last)
     return ((now.tv_sec-last.tv_sec)*1000000+(now.tv_usec-last.tv_usec));
 }
 /* 重新设定BroadcastTime,成为leader发心跳的时候需要重置 */
-/* -200000us是为了让记录的m_lastBroadcastTime变早，这样在appendLoop中getMyduration(m_lastBroadcastTime)直接达到要求 */
+/* -200000us是为了让记录的m_lastBroadcastTime变早，这样在processEntriesLoop中getMyduration(m_lastBroadcastTime)直接达到要求 */
+/* 为了让刚成为LEADER的服务器快速的向其它服务器发送心跳告知 */
 void Raft::setBroadcastTime()
 {
     gettimeofday(&m_lastBroadcastTime,NULL);
@@ -437,24 +439,27 @@ RequestVoteReply Raft::requestVote(RequestVoteArgs args)
     return reply;
 }
 
-/* 处理日志同步 */
+/* 处理日志同步 其实只有LEADER会操作这个函数 LEADER没有达到心跳时间也不会操作这个函数*/
 void* Raft::processEntriesLoop(void* arg)
 {
     Raft* raft=(Raft*)arg;
     while(!raft->dead){
         usleep(1000);
         raft->m_lock.lock();
+        /* 不是LEADER直接返回 */
         if(raft->m_state!=LEADER){
             raft->m_lock.unlock();
             continue;
         }
 
+        /* 是LEADER但没有达到心跳时间 */
         int during_time=raft->getMyduration(raft->m_lastBroadcastTime);
         if(during_time<HEART_BEART_PERIOD){
             raft->m_lock.unlock();
             continue;
         }
 
+        /* 更新上次心跳时间 向每个FOLLOWER发送AppendRPC */
         gettimeofday(&raft->m_lastBroadcastTime,NULL);
         raft->m_lock.unlock();
         pthread_t tid[raft->m_peers.size()-1];
@@ -480,17 +485,21 @@ void* Raft::sendAppendEntries(void* arg)
         raft->cur_peerId++;
     }
     int clientPeerId=raft->cur_peerId;
+    /* 获得每个FOLLOWR绑定的处理AppendRPC的端口 */
     client.as_client("127.0.0.1",raft->m_peers[raft->cur_peerId++].m_port.second);
     if(raft->cur_peerId==raft->m_peers.size()||
         raft->cur_peerId==raft->m_peers.size()-1&&raft->m_peerId==raft->cur_peerId){
         raft->cur_peerId=0;
     }
 
+    /* 设置发送的AppendRPC的参数 */
     args.m_term=raft->m_curTerm;
     args.m_leaderId=raft->m_peerId;
     args.m_leaderCommit=raft->m_commitIndex;
-    args.m_prevLogIndex=raft->m_nextIndex[clientPeerId]-1;
+    /* m_nextIndex表示的是下一个要发送的log的index+1 m_prevLogIndex表示的是当前要对比的log的index+1*/
+    args.m_prevLogIndex=raft->m_nextIndex[clientPeerId]-1;  
 
+    /* 将index在m_prevLogIndex-1之后的log都发送给FOLLOWER */
     for(int i=args.m_prevLogIndex;i<raft->m_logs.size();i++){
         args.m_sendLogs+=(raft->m_logs[i].m_command+','+to_string(raft->m_logs[i].m_term)+';');
     }
@@ -509,6 +518,7 @@ void* Raft::sendAppendEntries(void* arg)
     AppendEntriesReply reply=client.call<AppendEntriesReply>("appendEntries",args).val();
 
     raft->m_lock.lock();
+    /* 如果LEADER发现有FOLLOWER的term比自己大就重置自己的状态，变成FOLLOWER */
     if(reply.m_term>raft->m_curTerm){
         raft->m_state=FOLLOWER;
         raft->m_curTerm=reply.m_term;
@@ -531,6 +541,12 @@ void* Raft::sendAppendEntries(void* arg)
             raft->m_commitIndex=realMajotiryMatchIndex;
         }
     } else {// append失败
+        /* 
+            只有followr的m_logs[args.m_prevLogIndex-1]!=leader的m_prevLogTerm的时候m_conflict_term==-1 
+            也就是log冲突时m_conflict_term!=-1
+            此时m_conflict_term记录的是follower的m_prevLogIndex-1的term
+            而m_conflict_index记录的是follower的中第一个m_prevLogTerm的位置 m_prevLogTerm是leader期望的term
+        */
         if(reply.m_conflict_term!=-1){
             int leader_conflict_index=-1;
             for(int index=args.m_prevLogIndex;index>=1;index--){
@@ -539,12 +555,13 @@ void* Raft::sendAppendEntries(void* arg)
                     break;
                 }
             }
+            /* leader_conflict_index记录了leader中最后一个m_conflict_term的位置 m_conflict_term是follower实际上的term*/
             if(leader_conflict_index!=-1){
                 raft->m_nextIndex[clientPeerId]=leader_conflict_index+1;
             } else {
                 raft->m_nextIndex[clientPeerId]=reply.m_conflict_index;
             }
-        }else{ // m_conflict_term==1代表follower的log长度小于leader记录的nextIndex-1
+        }else{ // m_conflict_term==-1 代表follower的log长度小于leader记录的m_prevLogIndex
             raft->m_nextIndex[clientPeerId]=reply.m_conflict_index+1;
         }
     }
@@ -554,6 +571,10 @@ void* Raft::sendAppendEntries(void* arg)
 
 /* 这个函数是client收到appendLog请求执行的函数 返回appendLog是否成功等 */
 AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args){
+    /* 
+        解析LEADER传来的后续log 这里的log是LEADER通过判断记录的nextIndex得出的应该发给FOLLOWER的log 
+        但这个log不一定对 还需要FOLLOWER自己判断是否和自己的log冲突
+     */
     vector<LogEntry> recvLog=getCmdAndTerm(args.m_sendLogs);
     AppendEntriesReply reply;
     m_lock.lock();
@@ -562,13 +583,16 @@ AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args){
     reply.m_conflict_index=-1;
     reply.m_conflict_term=-1;
 
-    // leader的term小于当前服务器的term直接返回false
+    /* leader的term小于当前服务器的term直接返回false leader得到这个reply会把自己变成follower*/
     if(args.m_term<m_curTerm){
         m_lock.unlock();
         return reply;
     }
 
-    // leader的term大于等于当前服务器的term，需要修改当前服务器的term
+    /* 
+        leader的term大于等于当前服务器的term，需要修改当前服务器的term为leader的term
+        并且当前服务器需要重置自己在这个term的投票对象，并且把自己转为follower
+    */
     if(args.m_term>=m_curTerm){
         if(args.m_term>m_curTerm){
             m_votedFor=-1;
@@ -580,10 +604,16 @@ AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args){
 
     printf("[%d] recv append from [%d] at self term%d,send term%d,duration is %d\n",
             m_peerId,args.m_leaderId,m_curTerm,args.m_term,getMyduration(m_lastWakeTime));
+    /* 修改lastWakeTime，防止不必要的voteRPC */
     gettimeofday(&m_lastWakeTime,NULL);
 
+    /* 后续代码是FOLLOWER自己判断log是否冲突 要如何写入log */
     int logSize=0;
-    // 如果当前服务器没有log 就可以直接把leader传来的log写入
+    /* 
+        如果当前服务器没有log 就可以直接把leader传来的log写入
+        其实这里是有问题的，如果leader发了两个0到2和3到4两个包
+        如果发来的0到2的log包丢失了，而3到4的log包到了，也会直接写入 
+    */
     if(m_logs.size()==0){
         for(const auto& log:recvLog){
             push_backLog(log);
@@ -597,7 +627,7 @@ AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args){
         reply.m_success=true;
         return reply;
     }
-    // 如果follower的log长度小于leader记录的nextIndex-1就需要返回false并且记录conflict_index
+    /* 如果follower的log长度小于leader记录的m_prevLogIndex就需要返回false并且记录conflict_index为followr的log长度 */
     if(m_logs.size()<args.m_prevLogIndex){
         printf("[%d]'s logs.size:%d < [%d]'s prevLogIdx: %d\n",m_peerId,m_logs.size(),args.m_leaderId,args.m_prevLogIndex);
         reply.m_conflict_index=m_logs.size();
@@ -605,14 +635,15 @@ AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args){
         reply.m_success=false;
         return reply;
     }
-    // 如果follower的log长度不小于leader记录的nextIndex-1 但follower记录的term和leader记录的不同
-    // 就需要返回false并且记录conflict_index和conflict_term
-    // 通过判断conflict_term来判断是哪一种冲突
+    /*
+        如果follower的log长度不小于leader记录的m_prevLogIndex 但follower记录的term和leader记录的不同
+        就需要返回false并且记录conflict_index和conflict_term
+        通过判断conflict_term来判断是哪一种冲突
+    */
     if(args.m_prevLogIndex>0&&m_logs[args.m_prevLogIndex-1].m_term!=args.m_prevLogTerm){
         printf("[%d]'s prevLogterm : %d != [%d]'s prevLogTerm : %d\n",m_peerId,m_logs[args.m_prevLogIndex-1].m_term,args.m_leaderId,args.m_prevLogTerm);
-
         reply.m_conflict_term=m_logs[args.m_prevLogIndex-1].m_term;
-        for(int index=1;index<=m_logs[args.m_prevLogIndex-1].m_term;index++){
+        for(int index=1;index<=args.m_prevLogIndex;index++){
             if(m_logs[index-1].m_term==reply.m_conflict_term){
                 reply.m_conflict_index=index;
                 break;
@@ -636,7 +667,7 @@ AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args){
         m_commitIndex=min(logSize,args.m_leaderCommit);
     }
 
-    for(auto a:m_logs) printf("%d ",a.m_term);
+    for(LogEntry a:m_logs) printf("%d ",a.m_term);
     printf("[%d] sync success\n",m_peerId);
     m_lock.unlock();
     reply.m_success=true;
@@ -822,6 +853,7 @@ void Raft::saveRaftState()
 
 int main(int argc,char* argv[])
 {
+    
     if(argc<2){
         printf("loss parameter of peersNum\n");
         exit(-1);
@@ -831,6 +863,7 @@ int main(int argc,char* argv[])
         printf("the peersNum should be odd\n");                 // 必须传入奇数
         exit(-1);
     }
+    
     srand((unsigned)time(NULL));
     vector<PeersInfo> peers(peerNum);
     for(int i=0;i<peerNum;i++){
@@ -843,12 +876,11 @@ int main(int argc,char* argv[])
     for(int i=0;i<peers.size();i++){
         raft[i].Make(peers,i);
     }
-    cout<<"--------------------------------TEST--------------------------------\n";
     /*--------------------test部分----------------------*/
     usleep(400000);
     for(int i=0;i<peers.size();i++){
         if(raft[i].getState().second){
-            for(int j=0;j<1000;j++){
+            for(int j=0;j<10;j++){
                 Operation opera;
                 opera.op="put";
                 opera.key=to_string(j);

@@ -5,6 +5,14 @@
         "list": "cpp",
         "vector": "cpp",
         "string_view": "cpp",
-        "ostream": "cpp"
+        "ostream": "cpp",
+        "mutex": "cpp",
+        "shared_mutex": "cpp",
+        "bitset": "cpp",
+        "variant": "cpp",
+        "random": "cpp",
+        "string": "cpp",
+        "cmath": "cpp",
+        "complex": "cpp"
     }
 }
