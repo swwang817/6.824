@@ -118,7 +118,7 @@ public:
     static void* sendAppendEntries(void* arg);              // 发appendRPC的线程
     static void* applyLogLoop(void* arg);                   // 持续向上层应用日志的守护线程
 
-    enum RAFT_STATE {LEADER=0,CANDIDATE=1,FOLLOWER=2};              // 用枚举定义的raft三种状态
+    enum RAFT_STATE {LEADER=0,CANDIDATE=1,FOLLOWER=2};          // 用枚举定义的raft三种状态
     void Make(vector<PeersInfo> peers,int id);                  // raft初始化
     int getMyduration(timeval last);                            // 传入某个特定计算到当下的持续时间
     void setBroadcastTime();                                    // 重新设定BroadcastTime,成为leader发心跳的时候需要重置
@@ -228,6 +228,7 @@ int Raft::getMyduration(timeval last)
 
     return ((now.tv_sec-last.tv_sec)*1000000+(now.tv_usec-last.tv_usec));
 }
+
 /* 重新设定BroadcastTime,成为leader发心跳的时候需要重置 */
 /* -200000us是为了让记录的m_lastBroadcastTime变早，这样在processEntriesLoop中getMyduration(m_lastBroadcastTime)直接达到要求 */
 /* 为了让刚成为LEADER的服务器快速的向其它服务器发送心跳告知 */
