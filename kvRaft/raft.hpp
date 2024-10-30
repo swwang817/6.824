@@ -13,7 +13,14 @@ using namespace std;
 #define COMMOM_PORT 12345
 #define HEART_BEART_PERIOD 1000
 
-/* 新增的快照PRC需要传的参数，具体看论文section7关于日志压缩的内容 */
+/* 
+    新增的快照PRC需要传的参数，具体看论文section7关于日志压缩的内容
+    term:当前任期
+    leaderId:leader的id
+    lastIncludedIndex:leader上次快照日志截断处的索引
+    lastIncludedTerm:leader上次快照日志截断处的任期
+    snapShot:leader存储的快照
+*/
 class InstallSnapShotArgs{
 public:
     int term;
@@ -65,7 +72,7 @@ public:
 
 class ApplyMsg{
 public:
-    bool commandValid;
+    bool commandValid;              // 用于标识是否是快照消息
     string command;
     int commandIndex;
     int commandTerm;
@@ -99,6 +106,7 @@ Operation ApplyMsg::getOperation()
     return operation;
 }
 
+/* 存储了每个raft的两个处理选举和Append的端口和raft的id */
 class PeersInfo{
 public:
     pair<int,int> m_port;
@@ -106,6 +114,7 @@ public:
     bool isInstallFlag;
 };
 
+/* 单条日志 */
 class LogEntry{
 public:
     LogEntry(string cmd="",int term=-1):m_command(cmd),m_term(term){}
@@ -113,6 +122,16 @@ public:
     int m_term;
 };
 
+/* 
+    需要持久化的数据
+    logs:日志
+    snapShot:快照
+    cur_term:当前任期
+    voted_for:投票给谁
+    lastIncludedIndex:上次快照日志截断处的索引
+    lastIncludedTerm:上次快照日志截断处的任期
+ 
+*/
 class Persister{
 public:
     vector<LogEntry> logs;
@@ -123,6 +142,15 @@ public:
     int lastIncludedTerm;
 };
 
+/* 
+    AppendRPC需要的参数 
+    term:当前任期
+    leaderId:leader的id
+    prevLogIndex:leader记录的当前接受Append的raft的prevLogIndex
+    prevLogTerm:leader记录的当前接受Append的raft的prevLogTerm
+    leaderCommit:leader已经提交给kvServer的最大日志索引
+    sendLogs:leader发送的日志
+*/
 class AppendEntriseArgs{
 public:
     int m_term;
@@ -141,6 +169,13 @@ public:
     }
 };
 
+/* 
+    接受Append的raft的返回 
+    term:当前任期
+    success:是否成功
+    conflict_index:冲突的索引
+    conflict_term:冲突的任期
+*/
 class AppendEntriseReply{
 public:
     int m_term;
@@ -149,6 +184,13 @@ public:
     int m_conflict_term;
 };
 
+/* 
+    请求voteRPC的参数
+    term:当前任期
+    candidateId:候选人id
+    lastLogIndex:候选人最后一条日志的索引
+    lastLogTerm:候选人最后一条日志的任期
+*/
 class RequestVoteArgs{
 public:
     int term;
@@ -157,6 +199,11 @@ public:
     int lastLogTerm;
 };
 
+/*
+    请求voteRPC的返回
+    term:当前任期
+    voteGranted:是否投票
+*/
 class RequestVoteReply{
 public:
     int term;
@@ -189,6 +236,7 @@ public:
     StartRet start(Operation op);                                   // 向raft传日志的函数，只有leader响应并立即返回，应用层用到
     
     void printLogs();
+    /* 用信号量维护raft和kvServer之间的通讯 */
     void setSendsem(int num);       // 初始化send的信号量，结合kvServer层的有名管道fifo模拟go的select及channel
     void setRecvsem(int num);       // 初始化recv的信号量，结合kvServer层的有名管道fifo模拟go的select及channel                        
     bool waitSendsem();             // 信号量函数封装，用于类复合时kvServer的类外调用
@@ -197,19 +245,19 @@ public:
     bool postRecvsem();             // 信号量函数封装，用于类复合时kvServer的类外调用
     ApplyMsg getBackMsg();          // 取得一个msg，结合信号量和filo模拟go的select及channel，每次只取一个，处理完再取
 
-    void serialize();               // 序列化
-    bool deserialize();             // 反序列化
-    void saveRaftState();           // 持久化
-    void readRaftState();           // 读取持久化状态
+    void serialize();               // 序列化 就是保存成文件
+    bool deserialize();             // 反序列化 就是从文件中读取
+    void saveRaftState();           // 持久化 修改persister中的数据并且调用serialize
+    void readRaftState();           // 调用deserialize读取文件并修改persister中的数据 
     bool isKilled();                // check is killed
     void kill();                    // 设定raft状态为dead
     void activate();                                            
 
-    bool ExceedLogSize(int size);                                   // 超出日志大小需要快照，kvServer层需要有个守护进程持续调用该汉函数判断
-    void recvSnapShot(string snapShot,int lastIncludeIndex);        // 接受来自kvServer层的快照，用于持久化
+    bool ExceedLogSize(int size);                                   // 超出日志大小需要快照，kvServer层需要有个守护进程持续调用该函数判断
+    void recvSnapShot(string snapShot,int lastIncludeIndex);        // 接受来自kvServer层的快照(就是当前kvServer的状态)，压缩日志并且持久化
     int idxToCompressLogPos(int indes);                             // 获得原先索引在截断日志后的索引
-    bool readSnapShot();                                            // 读取快照
-    void saveSnapShot();                                            // 持久化快照
+    bool readSnapShot();                                            // 从持久化文件中读取快照
+    void saveSnapShot();                                            // 持久化快照到对应的文件中
     void installSnapShotTokvServer();                               // 落后的raft向对应的应用层安装快照
     int lastIndex();                                                // 截断日志后的lastIndex
     int lastTerm();                                                 // 截断日志后的lastTerm
@@ -217,8 +265,8 @@ public:
 private:
     locker m_lock;
     cond m_cond;
-    vector<PeersInfo> m_peers;
-    Persister persister;
+    vector<PeersInfo> m_peers;      // 用于存储所有raft的端口信息
+    Persister persister;            // 用于持久化的类
     int m_peerId;
     int dead;
 
@@ -229,27 +277,28 @@ private:
     int m_lastIncludedIndex;        // 新增的持久化变量，存上次快照日志截断处的相关信息
     int m_lastIncludedTerm;         // 新增的持久化变量，存上次快照日志截断处的相关信息
 
-    vector<int> m_nextIndex;        
-    vector<int> m_matchIndex;
-    int m_lastApplied;
-    int m_commitIndex;
+    vector<int> m_nextIndex;        // leader为每一个follower维护的下一个要发送的日志索引
+    vector<int> m_matchIndex;       // leader为每一个follower维护的已经复制的日志索引
+    int m_lastApplied;              // 已经向上层应用的日志索引
+    int m_commitIndex;              // leader维护的已经提交的日志索引，大多数服务器已经复制的日志索引
 
-    int recvVotes;
-    int finishedVote;
-    int cur_peerId;
+    int recvVotes;                  // 用于统计收到的投票数
+    int finishedVote;               // 用于统计已经完成投票的数目
+    int cur_peerId;                 // 用于记录请求投票时当前处理到那个peerId
 
     RAFT_STATE m_state;                     
     int m_leaderId;                         
-    struct timeval m_lastWakeTime;          
-    struct timeval m_lastBroadcastTime;     
+    struct timeval m_lastWakeTime;          // 用于记录最后一次接受到leader传来消息的时间
+    struct timeval m_lastBroadcastTime;     // leader最后一次广播时间    
 
     sem m_recvsem;                      // 结合kvServer层的有名管道fifo模拟go的select及channel
     sem m_sendsem;                      // 结合kvServer层的有名管道fifo模拟go的select及channel
-    vector<ApplyMsg> m_msgs;            // 在applyLogLoop中存msg的容易，每次存一条，处理完再存一条
+    vector<ApplyMsg> m_msgs;            // 在applyLogLoop中存msg的容器，每次存一条，处理完再存一条
 
-    unordered_set<int> isExistIndex;        //用于在processEntriesLoop中标识append和install端口对应分配情况
+    unordered_set<int> isExistIndex;        // 用于在processEntriesLoop中标识append和install端口对应分配情况
 };
 
+/* 初始化raft 并且开三个线程：监听投票，向follower Append日志，向上层Apply日志*/
 void Raft::Make(vector<PeersInfo> peers,int id)
 {
     m_peers=peers;
@@ -342,7 +391,11 @@ void Raft::setBroadcastTime()
     }
 }
 
-/* 用于监听voteRPC的 */
+/* 
+    用于监听voteRPC的
+    绑定处理请求投票的函数requestVote到对应的端口
+    同时开一个线程不断判断当前raft是否发起选举并且处理选举
+*/
 void* Raft::listenForVote(void* arg)
 {
     Raft* raft=(Raft*) arg;
@@ -359,7 +412,12 @@ void* Raft::listenForVote(void* arg)
 }
 
 
-/* 用于监听appendRPC */
+/* 
+    用于监听appendRPC 
+    把处理Append的函数appendEntries绑定到对应的端口  
+    把处理快照的函数installSnapShot绑定到对应的端口
+    同时开一个线程不断判断当前raft是否向其它follower发送日志并且处理日志同步(其实只有leader且到达心跳时间才会调用)
+*/
 void* Raft::listenForAppend(void* arg)
 {
     Raft* raft=(Raft*)arg;
@@ -388,6 +446,7 @@ void* Raft::electionLoop(void* arg)
             raft->m_lock.lock();
 
             int during_time=raft->getMyduration(raft->m_lastWakeTime);
+            /* 超时便开始选举，把自己改为候选人 */
             if(raft->m_state==FOLLOWER&&during_time>timeOut){
                 raft->m_state=CANDIDATE;
             }
@@ -396,6 +455,7 @@ void* Raft::electionLoop(void* arg)
                 printf(" %d attempt election at term %d,timeOut is %d\n",raft->m_peerId,raft->m_curTerm,timeOut);
                 gettimeofday(&raft->m_lastWakeTime,NULL);
                 resetFlag=true;
+                /* 重新选举需要把curTerm++ */
                 raft->m_curTerm++;
                 raft->m_votedFor=raft->m_peerId;
                 raft->saveRaftState();
@@ -406,6 +466,7 @@ void* Raft::electionLoop(void* arg)
 
                 pthread_t tid[raft->m_peers.size()-1];
                 int i=0;
+                /* 向其它所有raft请求投票 */
                 for(auto server:raft->m_peers){
                     if(server.m_peerId==raft->m_peerId) continue;
                     pthread_create(tid+i,NULL,callRequestVote,raft);
@@ -421,6 +482,7 @@ void* Raft::electionLoop(void* arg)
                     raft->m_lock.unlock();
                     continue;
                 }
+                /* 获得超过半数投票 */
                 if(raft->recvVotes>raft->m_peers.size()/2){
                     raft->m_state=LEADER;
                     for(int i=0;i<raft->m_peers.size();i++){
@@ -446,6 +508,7 @@ void* Raft::callRequestVote(void* arg)
     Raft* raft=(Raft*) arg;
     buttonrpc client;
     raft->m_lock.lock();
+    /* 设置请求voteRPC的参数 */
     RequestVoteArgs args;
     args.candidateId=raft->m_peerId;
     args.term=raft->m_curTerm;
@@ -464,11 +527,13 @@ void* Raft::callRequestVote(void* arg)
     }
     raft->m_lock.unlock();
 
+    /* 获得其它raft的投票结果 */
     RequestVoteReply reply=client.call<RequestVoteReply>("requestVote",args).val();
 
     raft->m_lock.lock();
     raft->finishedVote++;
     raft->m_cond.signal();
+    /* 如果其它raft的term大于当前raft则退出选举变为follower */
     if(reply.term>raft->m_curTerm){
         raft->m_state=FOLLOWER;
         raft->m_curTerm=reply.term;
@@ -533,7 +598,7 @@ RequestVoteReply Raft::requestVote(RequestVoteArgs args)
     return reply;
 }
 
-/* 处理日志同步 其实只有LEADER会操作这个函数 LEADER没有达到心跳时间也不会操作这个函数*/
+/* 处理日志同步 其实只有LEADER会操作这个函数 LEADER没有达到心跳时间也不会操作这个函数 */
 void* Raft::processEntriesLoop(void* arg)
 {
     Raft* raft=(Raft*)arg;
@@ -559,14 +624,14 @@ void* Raft::processEntriesLoop(void* arg)
         int i=0;
         for(auto& server:raft->m_peers){
             if(server.m_peerId==raft->m_peerId) continue;
-            /* 进入install分支的条件，日志落后于leader的快照 */
+            /* 进入install分支的条件，如果接受Append的follower日志落后于leader的快照 */
             if(raft->m_nextIndex[server.m_peerId]<=raft->m_lastIncludedIndex){
                 printf("%d send install rpc to %d,whose nextIdx is %d,but leader's lastIncludeIdx is %d\n",
                         raft->m_peerId,server.m_peerId,raft->m_nextIndex[server.m_peerId],raft->m_lastIncludedIndex);
                 server.isInstallFlag=true;
                 pthread_create(tid+i,NULL,sendInstallSnapShot,raft);
                 pthread_detach(tid[i]);
-            } else {
+            } else { // 正常的appendRPC
                 printf("%d send append rpc to %d,whose nextIdx is %d\n",
                         raft->m_peerId,server.m_peerId,raft->m_nextIndex[server.m_peerId]);
                 pthread_create(tid+i,NULL,sendAppendEntries,raft);
@@ -578,6 +643,7 @@ void* Raft::processEntriesLoop(void* arg)
     }
 }
 
+/* Leader定时发送的appendRPC的函数 follower日志落后于leader的快照 */
 void* Raft::sendInstallSnapShot(void* arg)
 {
     Raft* raft=(Raft*)arg;
@@ -586,15 +652,9 @@ void* Raft::sendInstallSnapShot(void* arg)
     int clientPeerId;
     raft->m_lock.lock();
     for(int i=0;i<raft->m_peers.size();i++){
-        if(raft->m_peers[i].m_peerId==raft->m_peerId){
-            continue;
-        }
-        if(!raft->m_peers[i].isInstallFlag){
-            continue;
-        }
-        if(raft->isExistIndex.count(i)){
-            continue;
-        }
+        if(raft->m_peers[i].m_peerId==raft->m_peerId) continue;     // 忽略自己(leader)
+        if(!raft->m_peers[i].isInstallFlag) continue;               // 忽略不需要install的follower
+        if(raft->isExistIndex.count(i)) continue;                   // 忽略已经处理过的follower
         clientPeerId=i;
         raft->isExistIndex.insert(i);
         break;
@@ -602,6 +662,7 @@ void* Raft::sendInstallSnapShot(void* arg)
 
     client.as_client("127.0.0.1",raft->m_peers[clientPeerId].m_port.second);
 
+    /* 如果所有Follower的请求都已发送完毕，重置isInstallFlag和isExistIndex，以便下一个周期继续处理 */
     if(raft->isExistIndex.size()==raft->m_peers.size()-1){
         for(int i=0;i<raft->m_peers.size();i++){
             raft->m_peers[i].isInstallFlag=false;
@@ -626,6 +687,7 @@ void* Raft::sendInstallSnapShot(void* arg)
         return NULL;
     }
 
+    /* 如果LEADER发现有FOLLOWER的term比自己大就重置自己的状态，变成FOLLOWER */
     if(raft->m_curTerm<reply.term){
         raft->m_curTerm=reply.term;
         raft->m_state=FOLLOWER;
@@ -635,8 +697,10 @@ void* Raft::sendInstallSnapShot(void* arg)
         return NULL;
     }
 
+    /* 更新FOLLOWER的nextIndex和matchIndex,因为follower接受快照之后会改变日志大小 */
     raft->m_nextIndex[clientPeerId]=raft->lastIndex()+1;
     raft->m_matchIndex[clientPeerId]=args.lastIncludedIndex;
+
 
     raft->m_matchIndex[raft->m_peerId]=raft->lastIndex();
     vector<int> tmpIndex=raft->m_matchIndex;
@@ -649,17 +713,23 @@ void* Raft::sendInstallSnapShot(void* arg)
     raft->m_lock.unlock();
 }
 
+/* follower执行的installSnapShot的处理函数 */
 InstallSnapShotReply Raft::installSnapShot(InstallSnapShotArgs args)
 {
     InstallSnapShotReply reply;
     m_lock.lock();
     reply.term=m_curTerm;
 
+    /* 如果leader的term小于follower的term返回失败 */
     if(args.term<m_curTerm){
         m_lock.unlock();
         return reply;
     }
 
+    /*
+        leader的term大于等于当前服务器的term，需要修改当前服务器的term为leader的term
+        并且当前服务器需要重置自己在这个term的投票对象，并且把自己转为follower
+    */
     if(args.term>=m_curTerm){
         if(args.term>m_curTerm){
             m_votedFor=-1;
@@ -668,6 +738,7 @@ InstallSnapShotReply Raft::installSnapShot(InstallSnapShotArgs args)
         m_curTerm=args.term;
         m_state=FOLLOWER;
     }
+    /* 更新follower的lastWakeTime 防止错误的voteRPC出现 */
     gettimeofday(&m_lastWakeTime,NULL);
 
     printf("install rpc,agrs.last is %d, but selfLast is %d,size is %d\n",
@@ -675,8 +746,8 @@ InstallSnapShotReply Raft::installSnapShot(InstallSnapShotArgs args)
     if(args.lastIncludedIndex<=m_lastIncludedIndex){
         m_lock.unlock();
         return reply;
-    } else {
-        if(args.lastIncludedIndex<=lastIndex()){
+    } else {  // 快照正常接受
+        if(args.lastIncludedIndex<=lastIndex()){ // 如果快照的lastindex小于当前日志的lastindex，截断日志
             if(m_logs[idxToCompressLogPos(lastIndex())].m_term!=args.lastIncludedTerm){
                 m_logs.clear();
             } else {
@@ -700,6 +771,7 @@ InstallSnapShotReply Raft::installSnapShot(InstallSnapShotArgs args)
     return reply;
 }
 
+/* leader发送的Append中的日志是string类型的，需要用这个函数读出正确的vector<LogEntry> */
 vector<LogEntry> Raft::getCmdAndTerm(string text)
 {
     vector<LogEntry> logs;
@@ -729,12 +801,13 @@ vector<LogEntry> Raft::getCmdAndTerm(string text)
     return logs;
 }
 
+/* 把log添加到当前raft的logs的末尾 */
 void Raft::push_backLog(LogEntry log)
 {
     m_logs.emplace_back(log);
 }
 
-/* Leader定时发送appendRPC的函数 */
+/* leader对每一个follower都会执行的appendRPC的处理函数 */
 void* Raft::sendAppendEntries(void* arg)
 {
     Raft* raft=(Raft*)arg;
@@ -744,9 +817,9 @@ void* Raft::sendAppendEntries(void* arg)
     int clientPeerId;
 
     for(int i=0;i<raft->m_peers.size();i++){
-        if(raft->m_peers[i].m_peerId==raft->m_peerId) continue;
-        if(raft->m_peers[i].isInstallFlag) continue;
-        if(raft->isExistIndex.count(i)) continue;
+        if(raft->m_peers[i].m_peerId==raft->m_peerId) continue; // 忽略自身(leader)
+        if(raft->m_peers[i].isInstallFlag) continue;            // isInstallFlag用来表示当前followr是否需要安装快照
+        if(raft->isExistIndex.count(i)) continue;               // 忽略已发送请求的节点
         clientPeerId=i;
         raft->isExistIndex.insert(i);
         break;
@@ -755,6 +828,7 @@ void* Raft::sendAppendEntries(void* arg)
     /* 获得每个FOLLOWR绑定的处理AppendRPC的端口 */
     client.as_client("127.0.0.1",raft->m_peers[clientPeerId].m_port.second);
     
+    /* 如果所有Follower的请求都已发送完毕，重置isInstallFlag和isExistIndex，以便下一个周期继续处理 */
     if(raft->isExistIndex.size()==raft->m_peers.size()-1){
         for(int i=0;i<raft->m_peers.size();i++){
             raft->m_peers[i].isInstallFlag=false;
@@ -794,6 +868,7 @@ void* Raft::sendAppendEntries(void* arg)
     }
     
     raft->m_lock.unlock();
+    /* 返回follower是否接受append,不接受append则会给出conflictIndex和conflictTerm */
     AppendEntriesReply reply=client.call<AppendEntriesReply>("appendEntries",args).val();
 
     raft->m_lock.lock();
@@ -815,12 +890,14 @@ void* Raft::sendAppendEntries(void* arg)
 
     // append成功
     if(reply.m_success){
+        /* 修改follower对应的nextIndex和matchIndex */
         raft->m_nextIndex[clientPeerId]=args.m_prevLogIndex+raft->getCmdAndTerm(args.m_sendLogs).size();
         raft->m_matchIndex[clientPeerId]=raft->m_nextIndex[clientPeerId]-1;
         raft->m_matchIndxe[raft->m_peerId]=raft->lastIndex();
 
         vector<int> tmpIndex=raft->m_matchIndex;
         sort(tmpIndex.begin(),tmpIndex.end());
+        /* 判断是否超过半数已经更新日志超过m_commitIndex */
         int realMajotiryMatchIndex=tmpIndex[tmpIndex.size()/2];
         if(realMajotiryMatchIndex>raft->m_commitIndex&&
             (realMajorityMatchIndex<=raft->m_lastIncludedIndex||raft->m_logs[raft->idxToCompressLogPos(realMajorityMatchIndex)].m_term==raft->m_curTerm)){
@@ -832,6 +909,7 @@ void* Raft::sendAppendEntries(void* arg)
         */
         if(reply.m_conflict_term!=-1&&reply.m_conflict_term!=-100){
             int leader_conflict_index=-1;
+            /* 找到reply.m_conflict_term最后一次出现的index */
             for(int index=args.m_prevLogIndex;index>m_lastIncludedIndex;index--){
                 if(raft->m_logs[raft->idxToCompressLogPos(index)].m_term==reply.m_conflict_term){
                     leader_conflict_index=index;
@@ -839,9 +917,10 @@ void* Raft::sendAppendEntries(void* arg)
                 }
             }
             /* leader_conflict_index记录了leader中最后一个m_conflict_term的位置 m_conflict_term是follower实际上的term*/
-            if(leader_conflict_index!=-1){
+            /* 判断leader存不存在m_conflict_term */
+            if(leader_conflict_index!=-1){ // 存在
                 raft->m_nextIndex[clientPeerId]=leader_conflict_index+1;
-            } else {
+            } else { // 不存在
                 raft->m_nextIndex[clientPeerId]=reply.m_conflict_index;
             }
         }else{ 
@@ -853,7 +932,7 @@ void* Raft::sendAppendEntries(void* arg)
     raft->m_lock.unlock();
 }
 
-/* 这个函数是client收到appendLog请求执行的函数 返回appendLog是否成功等 */
+/* 这个函数是follower收到appendLog请求执行的函数 返回appendLog是否成功等 */
 AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args){
     /* 
         解析LEADER传来的后续log 这里的log是LEADER通过判断记录的nextIndex得出的应该发给FOLLOWER的log 
@@ -926,7 +1005,8 @@ AppendEntriesReply Raft::appendEntries(AppendEntriesArgs args){
             reply.m_success=false;
             return reply;
         }
-        /* 走到这里必然有日志，且prevLogIndex>0 */
+        /* 走到这里m_prevLogIndex对应的下标必然有日志，且prevLogIndex>0 */
+        /* 如果m_prevLogTerm对不上则寻找第一个m_conflict_term出现的index记为m_conflict_index */
         if(m_logs[idxToCompressLogPos(args.m_prevLogIndex)].m_term!=args.m_prevLogTerm){
             printf("[%d]'s prevLogterm:%d!=[%d]'s prevLogterm:%d\n",
             m_peerId,m_logs[idxToCompressLogPos(args.m_prevLogIndex)].m_term,args.m_leaderId,args.m_prevLogTerm);
@@ -974,6 +1054,7 @@ void Raft::activate(){
     printf("raft %d activate\n",m_peerId);
 }
 
+/* 向leader输入操作 */
 StartRet Raft::start(Operation op)
 {
     StartRet ret;
@@ -1101,6 +1182,7 @@ void Raft::readRaftState()
     printf("[%d]'s term: %d, votefor : %d,logs.size(): %d\n",m_peerId,m_votedFor,m_logs.size());
 }
 
+/* 序列化需要持久化的数据 */
 void Raft::saveRaftState()
 {
     persister.cur_term=m_curTerm;
@@ -1142,6 +1224,7 @@ ApplyMsg Raft::getBackMsg()
     return m_msgs.back();
 }
 
+/* 判断Log长度是否达到进行快照的长度 */
 bool Raft::ExceedLogSize(int size)
 {
     bool ret=false;
@@ -1156,21 +1239,25 @@ bool Raft::ExceedLogSize(int size)
     return ret;
 }
 
+/* 快照保存了KvServer的状态，这个函数是raft来接收KvServe传来的快照的 */
 void Raft::recvSnapShot(string snapShot,int lastIncludedIndex)
 {
     m_lock.lock();
 
+    /* 快照无效 */
     if(lastIncludedIndex<=m_lastIncludedIndex){
         m_lock.unlock();
         return;
     }
+    /* 计算需要压缩的log大小 */
     int compressLen=lastIncludedIndex-this->m_lastIncludedIndex;
     printf("[%d] before log.size is %d,compressLen is %d,lastIncludedIndex is %d\n",
             m_peerId,m_logs.size(),compressLen,lastIncludedIndex);
     printf("[%d]:%d-%d=compressLen is %d\n",m_peerId,lastIncludedIndex,this->m_lastIncludedIndex,compressLen);
-    this->m_lastIncludeedIndex=lastIncludedIndex;
     this->m_lastIncludedTerm=m_logs[idxToCompressLogPos(lastIncludedIndex)].m_term;
+    this->m_lastIncludeedIndex=lastIncludedIndex;
 
+    /* 压缩日志，快照保存了的日志就不再需要了 */
     vector<LogEntry> tmpLog;
     for(int i=compressLen;i<m_logs.size();i++){
         tmpLog.emplace_back(m_logs[i]);
@@ -1178,17 +1265,20 @@ void Raft::recvSnapShot(string snapShot,int lastIncludedIndex)
     m_logs=tmpLog;
     printf("[%d] after log.size is %d\n",m_peerId,m_logs.size());
 
+    /* 持久化快照 */
     persister.snapShot=snapShot;
     saveRaftState();
     saveSnapShot();
     m_lock.unlock();
 }
 
+/* 获得原先索引在截断日志后的索引 */
 int Raft::idxToCompressLogPos(int idx)
 {
     return idx-m_lastIncludedIndex-1;
 }
 
+/* 从持久化的文件中读取快照 */
 bool Raft::readSnapShot()
 {
     string filename="snapShot-"+to_string(m_peerId);
@@ -1213,6 +1303,7 @@ bool Raft::readSnapShot()
     return true;
 }
 
+/* 保存快照到持久化的文件中 */
 void Raft::saveSnapShot()
 {
     string filename="snapShot-"+to_string(m_peerId);
@@ -1225,10 +1316,11 @@ void Raft::saveSnapShot()
     close(fd);
 }
 
+/* follower接收leader发来的快照后需要把快照应用到服务器上 */
 void Raft::installSnapShotTokvServer()
 {
     m_lock.lock();
-    bool ret=readSnapShot();
+    bool ret=readSnapShot();                            // 读取快照，follower接收leader发来的快照后会把快照保存到文件中
 
     if(!ret){
         m_lock.unlock();
@@ -1236,7 +1328,7 @@ void Raft::installSnapShotTokvServer()
     }
 
     ApplyMsg msg;
-    msg.commandValid=false;
+    msg.commandValid=false;                    
     msg.snapShot=persister.snapShot;
     msg.lastIncludedIndex=persister.lastIncludedIndex;
     msg.lastIncludedTerm=persister.lastIncludedTerm;

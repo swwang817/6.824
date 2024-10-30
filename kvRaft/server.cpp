@@ -14,8 +14,8 @@ typedef std::chrono::steady_clock::time_point myTime;
 
 class kvServerInfo{
 public:
-    PeersInfo peersInfo;
-    vector<int> m_kvPort;
+    PeersInfo peersInfo;    // raft层的端口信息
+    vector<int> m_kvPort;   // KVServer各种RPC的端口
 };
 
 /* 用于定时的类，创建一个有名管道，若在指定时间内收到msg则处理业务逻辑，不然按照超时处理重试 */
@@ -130,12 +130,12 @@ public:
 class KVServer{
 public:
     static void* RPCserver(void* arg);
-    static void* applyLoop(void* arg);                  //持续监听raft层提交的msg守护线程
-    static void* snapShotLoop(void* arg);               //持续监听raft层日志是否超过给定大小，判断进行快照的守护线程
+    static void* applyLoop(void* arg);                  // 持续监听raft层提交的msg并应用到kvServer的状态机
+    static void* snapShotLoop(void* arg);               // 持续监听raft层日志是否超过给定大小，判断是否进行快照的守护线程
     void StartKvServer(vector<kvServerInfo>& kvInfo,int me,int maxRaftState);
-    vector<PeersInfo> getRaftPort(vector<kvServerInfo>& kvInfo);
-    GetReply get(GetArgs args);
-    PutAppendReply putAppend(PutAppendArgs args);
+    vector<PeersInfo> getRaftPort(vector<kvServerInfo>& kvInfo);        // 获取所有raft层的端口信息    
+    GetReply get(GetArgs args);                                         // 处理get请求
+    PutAppendReply putAppend(PutAppendArgs args);                       // 处理put和append请求 
 
     string test(string key){return m_database[key];}    // 测试其余不是leader的server状态机
 
@@ -148,9 +148,9 @@ public:
     void activateRaft();                                // 重新激活raft的功能
 private:
     locker m_lock;
-    Raft m_raft;
+    Raft m_raft;                                        // raft层
     int m_id;
-    vector<int> m_port;
+    vector<int> m_port;                                 // KVServer的RPC端口
     int cur_portId;
 
     int m_maxraftstate;                                 // 超过这个大小就快照
@@ -158,40 +158,45 @@ private:
 
     unordered_map<string,string> m_database;            // 模拟数据库
     unordered_map<int,int> m_clientSeqMap;              // 只记录特定客户端已提交的最大请求ID
-    unordered_map<int,OpContext*> m_requestMap;         // 记录当前PRC对应的上下文
+    unordered_map<int,OpContext*> m_requestMap;         // 记录index命令对应的上下文
 };
 
 void KVServer::StartKvServer(vector<kvServerInfo>& kvInfo,int me,int maxRaftState)
 {
-    this->m_id=me;
-    m_port=kvInfo[me].m_kvPort;
-    vector<PeersInfo> peers=getRaftPort(kvInfo);
-    this->m_maxraftstate=maxRaftState;
+    this->m_id=me;                                  // 获取当前server的id
+    m_port=kvInfo[me].m_kvPort;                     // 获取当前server的RPC端口
+    vector<PeersInfo> peers=getRaftPort(kvInfo);    // 获取所有raft层的端口信息
+    this->m_maxraftstate=maxRaftState;              // 设置快照大小
     m_lastAppliedIndex=0;
 
     m_raft.setRecvSem(1);
     m_raft.setSendSem(0);
-    m_raft.Make(peers, me);
+    m_raft.Make(peers, me);                         // 初始化与当前KVSever对应的raft层
 
-    m_database.clear();
-    m_clientSeqMap.clear();
-    m_requestMap.clear();
+    m_database.clear();                             // 初始化数据库
+    m_clientSeqMap.clear();                         // 初始化客户端请求ID
+    m_requestMap.clear();                           // 初始化请求上下文
 
-    pthread_t listen_tid1[m_port.size()];          // 创建多个用于监听客户端请求的PRCserver
-    for(int i=0;i<m_port.size();i++){
+    pthread_t listen_tid1[m_port.size()];           // 创建多个用于监听客户端请求的PRCserver
+    
+    /* 开启多个端口接收get和putAppend请求 */
+    for(int i=0;i<m_port.size();i++){           
         pthread_create(&listen_tid1+i,NULL,RPCserver,this);
         pthread_detach(listen_tid1[i]);
     }
 
     pthread_t listen_tid2;
+    /* 处理raft层提交的Apply请求 */
     pthread_create(&listen_tid2,NULL,applyLoop,this);
     pthread_detach(listen_tid2);
 
     pthread_t listen_tid3;
+    /* 不断检查Raft的日志长度是否超过设置的日志最大长度 超过则保存快照*/
     pthread_create(&listen_tid3,NULL,snapShotLoop,this);
     pthread_detach(listen_tid3);
 }
 
+/* 将get和putAppend请求绑定端口 */
 void* KVServer::RPCserver(void* arg)
 {
     KVServer* kv=(KVServer*)arg;
@@ -206,6 +211,7 @@ void* KVServer::RPCserver(void* arg)
     server.run();
 }
 
+/* 处理client发来的get请求 */
 GetReply KVServer::get(GetArgs args)
 {
     GetReply reply;
@@ -218,7 +224,7 @@ GetReply KVServer::get(GetArgs args)
     operation.clientId=args.clientId;
     operation.requestId=args.requestId;
 
-    StartRet ret=m_raft.start(operation);   // 把get的操作放到raft日志中
+    StartRet ret=m_raft.start(operation);   // 把get的操作放到Leader raft日志中 如果不是leader则返回false
     operation.term=ret.m_curTerm;
     operation.index=ret.m_curIndex;
 
@@ -228,11 +234,15 @@ GetReply KVServer::get(GetArgs args)
         return reply;
     }
 
-    OpContext opctx(operation);             // 创建RPC时的上下文信息并暂存到map中，其key为start返回的该条请求在raft日志中的唯一索引
+    OpContext opctx(operation);             // 创建进行RPC时的上下文信息并暂存到map中，其key为start返回的该条请求在raft日志中的唯一索引
     m_lock.lock();
-    m_requestMap[ret.m_cmdIndex]=&opctx;    
+    m_requestMap[ret.m_cmdIndex]=&opctx;    // 也就是说raft中的每一条日志都对应一个上下文信息    
     m_lock.unlock();
-    Select s(opctx.fifoName);               // 创建监听管道数据的定时对象
+    /* 
+    创建监听管道数据的定时对象 
+    这个管道应该连接的是KVserver和Raft层，等待Raft层的应用结果
+    */
+    Select s(opctx.fifoName);              
     myTime curTime=myClock::now();
     /* 超过2000000毫秒还没收到说明超时 */
     while(myDuration(myClock::now()-curTime).count()<2000000){
@@ -242,6 +252,7 @@ GetReply KVServer::get(GetArgs args)
         usleep(10000);
     }
 
+    /* 操作成功接收到结果 */
     if(s.isRecved){
         if(opctx.isWrongLeader){
             reply.isWrongLeader=true;
@@ -254,12 +265,14 @@ GetReply KVServer::get(GetArgs args)
         reply.isWrongLeader=true;
         cout<<"in get --------------timeout!!!\n";
     }
+    /* 清理请求上下文并返回响应 */
     m_lock.lock();
     m_requestMap.erase(ret.m_cmdIndex);
     m_lock.unlock();
     return reply;
 }
 
+/* 处理client发来的putAppend请求 */
 PutAppendReply KVServer::putAppend(PutAppendArgs args)
 {
     PutAppendReply reply;
@@ -271,7 +284,7 @@ PutAppendReply KVServer::putAppend(PutAppendArgs args)
     operation.clientId=args.clientId;
     operation.requestId=args.requestId;
 
-    StartRet ret=m_raft.start(operation);       // 把append的操作放到raft日志中
+    StartRet ret=m_raft.start(operation);       // 把putAppend的操作放到Leader raft日志中 如果不是leader则返回false
     operation.term=ret.m_curTerm;
     operation.index=ret.m_curIndex;
     if(ret.isLeader==false){
@@ -280,9 +293,9 @@ PutAppendReply KVServer::putAppend(PutAppendArgs args)
         return reply;
     }
 
-    OpContext opctx(operation);
+    OpContext opctx(operation);         // 创建进行RPC时的上下文信息并暂存到map中，其key为start返回的该条请求在raft日志中的唯一索引
     m_lock.lock();
-    m_requestMap[ret.m_cmdIndex]=&opctx;
+    m_requestMap[ret.m_cmdIndex]=&opctx;// raft中的每一条日志都对应一个上下文信息   
     m_lock.unlock();
 
     Select s(opctx.fifoName);
@@ -294,6 +307,7 @@ PutAppendReply KVServer::putAppend(PutAppendArgs args)
         usleep(10000);
     }
 
+    /* 操作成功接收到结果 */
     if(s.isRecved){
         if(opctx.isWrongLeader){
             reply.isWrongLeader=true;
@@ -310,16 +324,22 @@ PutAppendReply KVServer::putAppend(PutAppendArgs args)
     return reply;
 }
 
+/* 处理raft层提交的Apply请求 */
 void* KVServer::applyLoop(void* arg)
 {
     KVServer* kv=(KVServer*)arg;
     while(1){
-        kv->m_raft.waitSendSem();
-        ApplyMsg msg=kv->m_raft.getBackMsg();
+        kv->m_raft.waitSendSem();                       // 等待raft层提交的msg
+        ApplyMsg msg=kv->m_raft.getBackMsg();           // 从raft层获取msg
 
-        if(!msg.commandValid){                          // 为快照处理的逻辑
+        if(!msg.commandValid){                          // 如果msg.commandValid为false说明这条消息时快照消息，为快照处理的逻辑
             kv->m_lock.lock();
-            if(msg.snapShot,size()==0){
+            /* 
+            当msg.snapShot.size()==0时，将清空m_database和m_clientSeqMap。
+            否则，调用recoverySnapShot方法从快照数据中恢复KVServer的状态。
+            最后，更新m_lastAppliedIndex为快照中的最后日志索引。 
+            */
+            if(msg.snapShot.size()==0){
                 kv->m_database.clear();
                 kv->m_clientSeqMap.clear();
             } else {
@@ -337,6 +357,9 @@ void* KVServer::applyLoop(void* arg)
             bool isOpExist=false,isSeqExist=false;
             int prevRequestIdx=INT_MAX;
             OpContext* opctx=nullptr;
+            /*
+            
+            */
             if(kv->m_requestMap.count(index)){
                 isOpExist=true;
                 opctx=kv->m_requestMap[index];
@@ -345,6 +368,11 @@ void* KVServer::applyLoop(void* arg)
                     printf("not euqal term -> wrongLeadr:opctx %d, op : %d\n",opctx->op.term,operation.term);
                 }
             }
+            /* 
+            检查客户端请求序列号（保证幂等性） 
+            每个客户端请求有一个唯一的 clientId 和递增的 requestId，用于保证请求幂等性。
+            通过 m_clientSeqMap 来记录每个客户端的最大请求 ID，确保重复请求不会被重复执行。
+            */
             if(kv->m_clientSeqMap.count(operation.clientId)){
                 isSeqExist=true;
                 prevRequestIdx=kv->m_clientSeqMap[operation.clientId];
@@ -363,9 +391,11 @@ void* KVServer::applyLoop(void* arg)
                             kv->m_database[operation.key]=operation.value;
                         }
                     }
+                /* 若该操作的上下文已存在 */
                 } else if(isOpExist){
                     opctx->isIgnored=true;
                 }
+            /* 若是查询型操作 */
             } else {
                 if(isOpExist){
                     if(kv->m_database.count(operation.key)){
@@ -379,7 +409,10 @@ void* KVServer::applyLoop(void* arg)
 
             kv->m_lock.unlock();
 
-            // 保证只有存了上下文信息的leader才能唤醒管道，回应clerk的RPC请求(leader需要多做的工作)
+            /* 
+            保证只有存了上下文信息的leader才能唤醒管道，回应clerk的RPC请求(leader需要多做的工作)
+            只有leader会响应client的RPC请求，follower只会处理applyMsg
+            */
             if(isOpExist){
                 int fd=open(opctx->fifoName.c_str(),O_WRONLY);
                 char* buf="12345";
@@ -391,6 +424,10 @@ void* KVServer::applyLoop(void* arg)
     }
 }
 
+/*
+将当前KVServer的状态（包括键值数据库m_database和客户端请求状态m_clientSeqMap）序列化成一个字符串snapShot
+这个字符串就是快照数据，格式为：key1 value1.key2 value2;clientId1 requestId1.clientId2 requestId2;
+*/
 string KVServer::getSnapShot()
 {
     string snapShot;
@@ -413,12 +450,12 @@ void* KVServer::snapShotLoop(void* arg){
         int lastIncludeIndex;
         if(kv->m_maxraftstate!=-1&&kv->m_raft.ExceedLogSize(kv->m_maxraftstate)){
             kv->m_lock.lock();
-            snapShot=kv->getSnapShot();
+            snapShot=kv->getSnapShot();// 把当前KVServer的状态序列化成snapShot
             lastIncludeIndex=kv->m_lastAppliedIndex;
             kv->m_lock.unlock();
         }
         if(snapshot.size()!=0){
-            // 向raft层发送快照用于日志压缩，同时持久化
+            /* 向raft层发送快照用于日志压缩，同时持久化 */ 
             kv->m_raft.recvSnapShot(snapShot,lastIncludeIndex);
             printf("%d called recvsnapShot size is %d, lastapply is %d\n", kv->m_id, snapShot.size(), kv->m_lastAppliedIndex);
         }
@@ -451,6 +488,10 @@ vector<PeersInfo> KVServer::getRaftPort(vector<kvServerInfo>& kvInfo)
     return ret;
 }
 
+/* 
+当收到快照消息且快照存在的时候调用 
+快照格式为：key1 value1.key2 value2;clientId1 requestId1.clientId2 requestId2;
+*/
 void KVServer::recoverySnapShot(string snapShot)
 {
     printf("recovery is called\n");
@@ -541,7 +582,7 @@ void KVServer::activateRaft()
 
 int main()
 {
-    vector<kvServerInfo> servers=getKvServePort(5);
+    vector<kvServerInfo> servers=getKvServePort(5);         // 创建5个kvServer 定义每个server和raft的端口信息
     srand((unsigned)time(NULL));
     KVServer* kv=new KVServer[servers.size()];
     for(int i=0;i<servers.size();i++){
